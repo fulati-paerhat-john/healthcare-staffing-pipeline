@@ -33,17 +33,17 @@ these insights through an interactive dashboard.
 ```
 Google Drive (Source CSVs)
         ↓
-AWS S3 — Bronze Layer (raw, immutable, partitioned by state/date)
+AWS S3 — Bronze Layer (raw, immutable, partitioned by ingestion_date)
         ↓
-PySpark on Databricks — Silver Layer (cleaned, typed, flagged)
+Databricks PySpark — Silver Layer (cleaned, typed, flagged, Delta tables)
         ↓
-Snowflake + dbt — Gold Layer (metrics, marts, tests)
+Databricks Delta Lake + dbt — Gold Layer (metrics, marts, tests)
         ↓
 Streamlit + Plotly — Serving Layer (interactive dashboard)
 ```
 
 **Orchestration:** Apache Airflow (Docker locally → MWAA in production)
-**Infrastructure:** Terraform (all AWS + Snowflake resources as code)
+**Infrastructure:** Terraform (all AWS + Databricks resources as code)
 **CI/CD:** GitHub Actions (dbt tests + Terraform plan on every PR)
 
 ---
@@ -55,8 +55,8 @@ Streamlit + Plotly — Serving Layer (interactive dashboard)
 | Ingestion | Python + Google Drive API | Incremental extraction from source |
 | Raw Storage | AWS S3 (Bronze/Silver/Gold) | Scalable, durable, cost-effective data lake |
 | Processing | PySpark + Databricks | Distributed transformation at scale |
-| Warehouse | Snowflake | Industry standard for analytics + dbt's native home |
-| Transformation | dbt Core | Data lineage, testing, documentation, modularity |
+| Warehouse | Databricks Delta Lake | ACID transactions, unified compute + storage |
+| Transformation | dbt Core (dbt-databricks) | Data lineage, testing, documentation, modularity |
 | Orchestration | Apache Airflow (Docker) | Most widely adopted pipeline orchestrator |
 | IaC | Terraform | Reproducible, version-controlled infrastructure |
 | Dashboard | Streamlit + Plotly | Fast Python-native interactive visualization |
@@ -80,7 +80,7 @@ healthcare-staffing-pipeline/
 │   ├── variables.tf
 │   ├── s3.tf                         # Bronze / Silver / Gold S3 buckets
 │   ├── iam.tf                        # Least-privilege IAM roles
-│   └── snowflake.tf                  # Snowflake DB, schema, warehouse
+│   └── databricks.tf                 # Databricks workspace + clusters
 │
 ├── ingestion/                        # Bronze layer — raw data extraction
 │   ├── gdrive_extractor.py           # Google Drive → S3
@@ -94,7 +94,7 @@ healthcare-staffing-pipeline/
 │
 ├── dbt/                              # Gold layer — metrics and marts
 │   ├── dbt_project.yml
-│   ├── profiles.yml.example
+│   ├── profiles.yml.example          # Databricks connection profile
 │   ├── models/
 │   │   ├── staging/                  # 1:1 with sources, light casting
 │   │   ├── intermediate/             # Business logic and joins
@@ -117,7 +117,7 @@ healthcare-staffing-pipeline/
 │   │   └── 03_risk_flags.py
 │   ├── components/
 │   └── connectors/
-│       └── snowflake_conn.py
+│       └── databricks_conn.py        # Databricks SQL connector
 │
 ├── notebooks/                        # EDA only — never in pipeline path
 │   └── 01_eda_staffing.ipynb
@@ -183,7 +183,7 @@ DIMENSION TABLES (all LEFT JOIN on ccn)
 ├── dim_quality_claims              59,256 rows   many measures per facility
 └── dim_vbp_performance             10,858 rows   one row per facility
 
-MARTS (built by dbt on top of dims + fact)
+MARTS (built by dbt on Databricks Delta Lake)
 ├── mart_staffing_daily             PROVNUM × DATE
 ├── mart_staffing_by_state          STATE × MONTH
 ├── mart_facility_summary           PROVNUM (Q2 aggregated)
@@ -225,7 +225,7 @@ MARTS (built by dbt on top of dims + fact)
 |---|---|---|---|
 | 1 | Nurse hours per patient per day | Staffing | `(Hrs_RN + Hrs_LPN + Hrs_CNA) / MDScensus` |
 | 2 | Total hours by hospital, state, month | Staffing | Sum all `Hrs_` cols, group by PROVNUM/STATE/month |
-| 3 | Bed utilization rate | Facility | `MDScensus / number_of_certified_beds` (NH_ProviderInfo) |
+| 3 | Bed utilization rate | Facility | `MDScensus / number_of_certified_beds` |
 | 4 | Staffing levels vs bed occupancy | Facility | Join hrs_per_patient with occupancy rate |
 | 5 | Top 10 hospitals by patient throughput | Facility | Rank by avg `MDScensus` descending |
 | 6 | Facilities with lowest staffing vs load | Facility | Rank by `hrs_per_patient` ascending |
@@ -245,18 +245,13 @@ MARTS (built by dbt on top of dims + fact)
 
 | Metric | Category | Reason |
 |---|---|---|
-| % nurses working overtime | Staffing | No individual nurse records — data is facility-day aggregates |
+| % nurses working overtime | Staffing | No individual nurse records — facility-day aggregates only |
 | Shifts per nurse | Staffing | No individual nurse tracking in CMS PBJ data |
 | Department-level metrics | All | No department column exists in any source file |
 | Patient satisfaction scores | Quality | Not published in CMS PBJ or supporting files |
-| Average length of stay (ALOS) | Quality | No admission or discharge dates in any file |
-| Patient-to-nurse complaint ratio | Quality | No complaint data in any file |
-| Total payroll costs | Cost | CMS PBJ tracks hours only — no wage or salary data |
-| Cost per patient stay | Cost | No financial data in any CMS file used |
-| Overtime cost as % of payroll | Cost | No wage data available |
-| Hospital revenue vs expenses | Cost | Proprietary financial data — not in public CMS dataset |
-| Shift utilization by time of day | Operational | Daily totals only — no intra-day time breakdown |
-| Peak staffing hours | Operational | Same — no time-of-day granularity in source |
+| Average length of stay | Quality | No admission or discharge dates in any file |
+| All cost metrics | Cost | CMS PBJ tracks hours only — no wage or salary data |
+| Time-of-day metrics | Operational | Daily totals only — no intra-day breakdown |
 | Nurse attrition rate | Operational | No individual nurse tracking across time periods |
 
 ---
@@ -281,6 +276,7 @@ MARTS (built by dbt on top of dims + fact)
 - Docker Desktop
 - AWS CLI v2 (configured with named profile)
 - Terraform 1.7+
+- Databricks CLI
 
 ### Installation
 
@@ -289,7 +285,7 @@ MARTS (built by dbt on top of dims + fact)
 git clone https://github.com/your-username/healthcare-staffing-pipeline.git
 cd healthcare-staffing-pipeline
 
-# Pin Python version (pyenv reads .python-version automatically)
+# Pin Python version
 pyenv local 3.11.9
 
 # Install all dependencies
@@ -301,17 +297,15 @@ eval $(poetry env activate)
 # Install pre-commit hooks
 pre-commit install
 
-# Copy environment variables template and fill in your values
+# Copy environment variables template
 cp .env.example .env
+# Fill in your credentials in .env
 ```
 
 ### AWS Configuration
 
 ```bash
-# Configure named profile — never use root or default
 aws configure --profile healthcare-pipeline
-
-# Verify credentials
 aws sts get-caller-identity --profile healthcare-pipeline
 ```
 
@@ -347,9 +341,9 @@ streamlit run app.py
 
 - [x] **Phase 1** — Repository setup, environment, EDA, data dictionary
 - [ ] **Phase 2** — Architecture design document + SME approval
-- [ ] **Phase 3** — Infrastructure (Terraform: S3, IAM, Snowflake)
+- [ ] **Phase 3** — Infrastructure (Terraform: S3, IAM, Databricks)
 - [ ] **Phase 4** — Ingestion pipeline (Google Drive → S3 Bronze)
-- [ ] **Phase 5** — PySpark transformations (Bronze → Silver)
+- [ ] **Phase 5** — PySpark transformations (Bronze → Silver Delta)
 - [ ] **Phase 6** — dbt models (Silver → Gold, metrics, tests)
 - [ ] **Phase 7** — Streamlit dashboard (staffing insights + risk flags)
 - [ ] **Phase 8** — Airflow orchestration (end-to-end DAG)
@@ -396,4 +390,4 @@ Data sourced from the **Centers for Medicare & Medicaid Services (CMS)**:
 
 ## 👤 Author
 
-Fulati Paerhati
+**Fulati Paerhati**
